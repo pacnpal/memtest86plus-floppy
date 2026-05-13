@@ -87,20 +87,32 @@ jobs:
           fi
 
           # 4) Drift detected: do the more expensive full-list backfill scan.
-          # Limit to 100 releases on each side as a sanity cap.
+          # Limit to 100 releases on each side as a sanity cap. Order upstream
+          # by publishedAt ASC so the build/release matrix processes them
+          # oldest-first; combined with max-parallel:1 on release, this makes
+          # the newest release end up last (i.e. at the top of the releases
+          # page).
           echo "Drift detected; scanning full release lists for missing tags."
-          UPSTREAM_TAGS=$(gh release list --repo "${UPSTREAM}" --limit 100 --json tagName --jq '[.[].tagName]')
-          OUR_TAGS=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName --jq '[.[].tagName]')
-          # Set difference: upstream tags that we don't have yet.
-          TAGS_JSON=$(jq -c -n --argjson u "${UPSTREAM_TAGS}" --argjson o "${OUR_TAGS}" '$u - $o')
-          echo "Missing tags: ${TAGS_JSON}"
+          UPSTREAM_TAGS=$(gh release list --repo "${UPSTREAM}" --limit 100 \
+            --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | [.[].tagName]')
+          OUR_TAGS=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 \
+            --json tagName --jq '[.[].tagName]')
+          # Preserve upstream's chronological order; drop tags we already have.
+          TAGS_JSON=$(jq -c -n --argjson u "${UPSTREAM_TAGS}" --argjson o "${OUR_TAGS}" '
+            [ $u[] | select( . as $t | ($o | index($t)) | not ) ]
+          ')
+          echo "Missing tags (oldest first): ${TAGS_JSON}"
           echo "tags=${TAGS_JSON}" >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build ${{ matrix.tag }} (${{ matrix.arch }})
     needs: detect
     if: needs.detect.outputs.tags != '[]'
-    runs-on: ubuntu-24.04
+    # Match the older toolchain used by upstream's own Linux.yml so older
+    # tags build cleanly. ubuntu-24.04's stricter compiler/linker has been
+    # observed to break some pre-v8.00 sources.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -153,21 +165,46 @@ jobs:
   release:
     name: Publish ${{ matrix.tag }}
     needs: [detect, build]
-    if: needs.detect.outputs.tags != '[]'
-    runs-on: ubuntu-24.04
+    # `!cancelled()` lets release run for tags whose builds succeeded even if
+    # a different tag's build failed (build has fail-fast:false). The
+    # per-tag artifact-existence check below short-circuits failed ones.
+    if: ${{ !cancelled() && needs.detect.outputs.tags != '[]' }}
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
+      # Serialize so releases are created in chronological order (oldest
+      # first); newest ends up last and therefore appears at the top of the
+      # GitHub releases page.
+      max-parallel: 1
       matrix:
         tag: ${{ fromJSON(needs.detect.outputs.tags) }}
     steps:
       - name: Download floppy artifacts for ${{ matrix.tag }}
+        id: download
         uses: actions/download-artifact@v4
         with:
           pattern: floppy-${{ matrix.tag }}-*
           path: dist
           merge-multiple: true
 
+      - name: Verify both floppy images are present
+        id: check
+        run: |
+          set -euo pipefail
+          # Expect exactly two .img files (i586 + x86_64). If either build
+          # failed upstream of us, skip publishing this tag rather than ship
+          # a partial release.
+          count=$(find dist -maxdepth 1 -name '*.img' -type f 2>/dev/null | wc -l | tr -d ' ')
+          echo "Found ${count} floppy image(s) for ${{ matrix.tag }}."
+          if [ "${count}" -lt 2 ]; then
+            echo "::warning::Skipping release of ${{ matrix.tag }} - expected 2 floppy images, found ${count}."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Generate checksums
+        if: steps.check.outputs.skip != 'true'
         working-directory: dist
         run: |
           set -euo pipefail
@@ -175,6 +212,7 @@ jobs:
           sha256sum -- *.img | tee SHA256SUMS
 
       - name: Create release ${{ matrix.tag }}
+        if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ matrix.tag }}
