@@ -244,15 +244,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Detect pre-releases by the semver-style "-suffix" convention
-          # (covers upstream's v6.00-beta1/beta2/beta3, plus any future
-          # -rc/-alpha/-preview/-dev variants). Stable tags like v6.00 or
-          # v8.00 have no dash and stay non-prerelease.
-          case "${TAG}" in
-            *-*) IS_PRERELEASE=true ;;
-            *)   IS_PRERELEASE=false ;;
+          # Pre-release policy:
+          #   * Tags in the BACKFILL_TAGS snapshot (the upstream tag set as
+          #     of this fork's first publish) are always released as stable,
+          #     including historical -beta tags. The backfill is a one-shot
+          #     catch-up; we don't want it cluttering the prerelease tab.
+          #   * Any tag NOT in the snapshot follows the semver -suffix rule:
+          #     a tag containing a dash (e.g. vX.Y-betaN, vX.Y-rcN) is
+          #     marked prerelease via gh's native --prerelease flag.
+          BACKFILL_TAGS="v6.00-beta1 v6.00-beta2 v6.00-beta3 v6.00 v6.01 v6.10 v6.20 v7.00 v7.20 v8.00"
+          case " ${BACKFILL_TAGS} " in
+            *" ${TAG} "*)
+              IS_PRERELEASE=false
+              echo "Tag ${TAG} is in the backfill snapshot; releasing as stable."
+              ;;
+            *)
+              case "${TAG}" in
+                *-*) IS_PRERELEASE=true ;;
+                *)   IS_PRERELEASE=false ;;
+              esac
+              echo "Tag ${TAG} is a forward release; prerelease=${IS_PRERELEASE}"
+              ;;
           esac
-          echo "Tag ${TAG} prerelease=${IS_PRERELEASE}"
 
           if [ "${IS_PRERELEASE}" = "true" ]; then
             PRERELEASE_FLAG="--prerelease"

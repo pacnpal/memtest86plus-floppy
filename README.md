@@ -23,10 +23,17 @@ upstream's release notes verbatim under a floppy-images header.
 Backfill is supported: when this fork has fewer releases than upstream, the
 workflow builds and publishes every missing upstream tag &mdash; including
 older git tags that never got a GitHub Release entry (e.g. `v6.00`) and
-pre-release tags (e.g. `v6.00-beta1`). Tags are processed in chronological
-(tag-commit date) order so the newest release ends up at the top of the
-releases page. Pre-release tags (anything with a `-suffix`) are published
-with GitHub's pre-release flag set so they sort below stable releases.
+historical pre-release tags (e.g. `v6.00-beta1`). Tags are processed in
+chronological (tag-commit date) order so the newest release ends up at
+the top of the releases page.
+
+Pre-release handling: the initial backfill (every upstream tag that
+existed when this fork was first published) is released as **stable**
+regardless of suffix, so the prerelease tab isn't cluttered with
+historical betas. Only **forward** tags &mdash; i.e. tags upstream
+adds after the backfill snapshot &mdash; follow the standard rule:
+anything matching the `vX.Y-suffix` pattern (e.g. `vX.Y-betaN`,
+`vX.Y-rcN`) is published with GitHub's native pre-release flag set.
 
 For other distribution formats (ISO images, UEFI binaries, USB-installable
 builds, nightly dev builds), see upstream and
