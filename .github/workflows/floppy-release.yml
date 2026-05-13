@@ -118,11 +118,6 @@ jobs:
       matrix:
         tag: ${{ fromJSON(needs.detect.outputs.tags) }}
         arch: [i586, x86_64]
-        include:
-          - arch: i586
-            dir: build/i586
-          - arch: x86_64
-            dir: build/x86_64
     steps:
       - name: Checkout upstream at ${{ matrix.tag }}
         uses: actions/checkout@v6
@@ -130,6 +125,33 @@ jobs:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ matrix.tag }}
           fetch-depth: 1
+
+      - name: Resolve build directory for layout
+        id: layout
+        # Upstream restructured the build dirs at v8.00:
+        #   v8.00+         -> build/i586, build/x86_64
+        #   v6.01 - v7.20  -> build32,    build64
+        # Pick whichever exists for this tag/arch.
+        env:
+          ARCH: ${{ matrix.arch }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          case "${ARCH}" in
+            i586)   candidates="build/i586 build32" ;;
+            x86_64) candidates="build/x86_64 build64" ;;
+            *) echo "::error::unknown arch ${ARCH}"; exit 1 ;;
+          esac
+          dir=""
+          for c in ${candidates}; do
+            if [ -d "${c}" ]; then dir="${c}"; break; fi
+          done
+          if [ -z "${dir}" ]; then
+            echo "::error::No build dir found for ${TAG}/${ARCH} (looked for: ${candidates})"
+            exit 1
+          fi
+          echo "Selected build directory: ${dir}"
+          echo "dir=${dir}" >> "${GITHUB_OUTPUT}"
 
       - name: Install build dependencies
         run: |
@@ -143,7 +165,7 @@ jobs:
             mtools
 
       - name: Build floppy.img
-        working-directory: ${{ matrix.dir }}
+        working-directory: ${{ steps.layout.outputs.dir }}
         env:
           TAG: ${{ matrix.tag }}
           ARCH: ${{ matrix.arch }}
@@ -158,7 +180,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: floppy-${{ matrix.tag }}-${{ matrix.arch }}
-          path: ${{ matrix.dir }}/memtest86plus-${{ matrix.tag }}-${{ matrix.arch }}-floppy.img
+          path: ${{ steps.layout.outputs.dir }}/memtest86plus-${{ matrix.tag }}-${{ matrix.arch }}-floppy.img
           if-no-files-found: error
           retention-days: 7
 
