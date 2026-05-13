@@ -62,47 +62,50 @@ jobs:
             exit 0
           fi
 
-          # Always need upstream's latest tag.
-          UPSTREAM_LATEST=$(gh release view --repo "${UPSTREAM}" --json tagName --jq .tagName)
-          echo "Upstream latest: ${UPSTREAM_LATEST}"
+          # Enumerate ALL upstream git tags (including older tags like v6.00
+          # and the v6.00-beta* pre-releases that never got a GitHub Release
+          # entry), ordered by tag-commit date ASCENDING (oldest first).
+          # One GraphQL call covers both "list every tag" and "give me the
+          # canonical chronological order" in a single hop.
+          OWNER="${UPSTREAM%/*}"
+          REPO="${UPSTREAM#*/}"
+          # shellcheck disable=SC2016 # $owner/$repo are GraphQL variables, not shell expansions
+          UPSTREAM_TAGS=$(gh api graphql -F owner="${OWNER}" -F repo="${REPO}" -f query='
+            query($owner: String!, $repo: String!) {
+              repository(owner: $owner, name: $repo) {
+                refs(refPrefix: "refs/tags/", first: 100,
+                     orderBy: {field: TAG_COMMIT_DATE, direction: ASC}) {
+                  nodes { name }
+                }
+              }
+            }
+          ' --jq '[.data.repository.refs.nodes[].name]')
+          echo "Upstream tags (oldest first): ${UPSTREAM_TAGS}"
 
-          # 2) Force flag without an explicit tag: rebuild just the latest.
+          # 2) Force flag without an explicit tag: rebuild the newest upstream tag.
           if [ "${FORCE:-false}" = "true" ]; then
-            echo "Force-rebuild requested; building upstream latest only."
+            UPSTREAM_LATEST=$(jq -r '.[-1]' <<<"${UPSTREAM_TAGS}")
+            echo "Force-rebuild requested; building upstream latest (${UPSTREAM_LATEST})."
             TAGS_JSON=$(jq -c -n --arg t "${UPSTREAM_LATEST}" '[$t]')
             echo "tags=${TAGS_JSON}" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          # 3) Cheap drift check: compare our latest release tag against upstream's.
-          # `gh release view` with no tag returns the latest; non-zero exit means
-          # we have no releases yet, which we treat as full drift (empty OUR_LATEST).
-          OUR_LATEST=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName 2>/dev/null || echo "")
-          echo "Our latest:      ${OUR_LATEST:-<none>}"
-
-          if [ "${OUR_LATEST}" = "${UPSTREAM_LATEST}" ]; then
-            echo "In sync; no backfill scan needed."
-            echo "tags=[]" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          # 4) Drift detected: do the more expensive full-list backfill scan.
-          # Limit to 100 releases on each side as a sanity cap. Order upstream
-          # by publishedAt ASC so the build/release matrix processes them
-          # oldest-first; combined with max-parallel:1 on release, this makes
-          # the newest release end up last (i.e. at the top of the releases
-          # page).
-          echo "Drift detected; scanning full release lists for missing tags."
-          UPSTREAM_TAGS=$(gh release list --repo "${UPSTREAM}" --limit 100 \
-            --json tagName,publishedAt \
-            --jq 'sort_by(.publishedAt) | [.[].tagName]')
+          # 3) Diff against our existing release tags. Set difference preserves
+          # the upstream chronological order, so the resulting matrix processes
+          # oldest-first; combined with max-parallel:1 on release, the newest
+          # tag is published last and appears at the top of the releases page.
           OUR_TAGS=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 \
             --json tagName --jq '[.[].tagName]')
-          # Preserve upstream's chronological order; drop tags we already have.
+          echo "Our tags: ${OUR_TAGS}"
           TAGS_JSON=$(jq -c -n --argjson u "${UPSTREAM_TAGS}" --argjson o "${OUR_TAGS}" '
             [ $u[] | select( . as $t | ($o | index($t)) | not ) ]
           ')
-          echo "Missing tags (oldest first): ${TAGS_JSON}"
+          if [ "${TAGS_JSON}" = "[]" ]; then
+            echo "Up to date; nothing to build."
+          else
+            echo "Missing tags (oldest first): ${TAGS_JSON}"
+          fi
           echo "tags=${TAGS_JSON}" >> "${GITHUB_OUTPUT}"
 
   build:
@@ -241,6 +244,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Detect pre-releases by the semver-style "-suffix" convention
+          # (covers upstream's v6.00-beta1/beta2/beta3, plus any future
+          # -rc/-alpha/-preview/-dev variants). Stable tags like v6.00 or
+          # v8.00 have no dash and stay non-prerelease.
+          case "${TAG}" in
+            *-*) IS_PRERELEASE=true ;;
+            *)   IS_PRERELEASE=false ;;
+          esac
+          echo "Tag ${TAG} prerelease=${IS_PRERELEASE}"
+
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+            TITLE="memtest86+ ${TAG} (floppy, pre-release)"
+          else
+            PRERELEASE_FLAG=""
+            TITLE="memtest86+ ${TAG} (floppy)"
+          fi
+
           # If a release already exists (force-rebuild path), remove it first
           # so `gh release create` can recreate it atomically with the new assets.
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
@@ -249,10 +270,16 @@ jobs:
           fi
 
           # Pull upstream's own release notes verbatim and prepend a header
-          # describing the floppy images shipped on this release.
-          upstream_body=$(gh release view "${TAG}" --repo "${UPSTREAM}" --json body --jq .body || true)
+          # describing the floppy images shipped on this release. Older
+          # tags (and pre-release tags) may not have a GitHub Release body;
+          # the helper falls back to a "no body" line in that case.
+          upstream_body=$(gh release view "${TAG}" --repo "${UPSTREAM}" --json body --jq .body 2>/dev/null || true)
 
           {
+            if [ "${IS_PRERELEASE}" = "true" ]; then
+              echo "> :warning: **Pre-release.** This release tracks upstream's pre-release tag \`${TAG}\` and is not a stable release."
+              echo
+            fi
             echo "## Floppy disk images"
             echo
             echo "This is an automated rebuild of upstream [\`${UPSTREAM}@${TAG}\`](https://github.com/${UPSTREAM}/releases/tag/${TAG}) packaged as 1.44 MB floppy disk images. Each \`*-floppy.img\` can be written directly to a 3.5\" floppy or booted via legacy BIOS as a floppy image (loopback, ROM emulation, virtual floppy in QEMU/VirtualBox, etc.)."
@@ -271,12 +298,14 @@ jobs:
             if [ -n "${upstream_body}" ]; then
               printf '%s\n' "${upstream_body}"
             else
-              echo "_Upstream did not provide a release body for [\`${TAG}\`](https://github.com/${UPSTREAM}/releases/tag/${TAG})._"
+              echo "_Upstream did not publish a release body for [\`${TAG}\`](https://github.com/${UPSTREAM}/releases/tag/${TAG})._"
             fi
           } > notes.md
 
+          # shellcheck disable=SC2086 # PRERELEASE_FLAG is intentionally word-split
           gh release create "${TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "memtest86+ ${TAG} (floppy)" \
+            --title "${TITLE}" \
             --notes-file notes.md \
+            ${PRERELEASE_FLAG} \
             dist/*.img dist/SHA256SUMS
