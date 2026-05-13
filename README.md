@@ -21,9 +21,12 @@ virtual floppy in QEMU/VirtualBox, etc.). The release notes embed
 upstream's release notes verbatim under a floppy-images header.
 
 Backfill is supported: when this fork has fewer releases than upstream, the
-workflow builds and publishes each missing upstream release in chronological
-order so the newest release ends up at the top of the releases page. The
-no-drift path (most scheduled runs) exits in seconds after two API calls.
+workflow builds and publishes every missing upstream tag &mdash; including
+older git tags that never got a GitHub Release entry (e.g. `v6.00`) and
+pre-release tags (e.g. `v6.00-beta1`). Tags are processed in chronological
+(tag-commit date) order so the newest release ends up at the top of the
+releases page. Pre-release tags (anything with a `-suffix`) are published
+with GitHub's pre-release flag set so they sort below stable releases.
 
 For other distribution formats (ISO images, UEFI binaries, USB-installable
 builds, nightly dev builds), see upstream and
