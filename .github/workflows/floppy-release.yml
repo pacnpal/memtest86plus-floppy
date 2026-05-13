@@ -1,0 +1,222 @@
+name: Floppy release on upstream release
+
+# Polls the upstream memtest86plus repo for new releases and, when one or more
+# appear that we haven't published yet, builds floppy.img for i586 and x86_64
+# and cuts a matching release in this fork. See README / release-tagging
+# notes: `gh release create` is used as the single command that creates both
+# the tag and the GitHub release.
+#
+# Detection is two-tiered:
+#   1. Cheap path (every run): compare our latest release tag against
+#      upstream's latest. If equal, we're in sync; jobs that follow are
+#      skipped via the empty-matrix rule and the run exits in seconds.
+#   2. Backfill path (only when latest tags differ): list all upstream
+#      releases and all of ours, compute the set difference, build them all.
+
+on:
+  schedule:
+    # Mon/Wed/Fri at 12:17 UTC. Offset off the hour to avoid the scheduler spike on :00.
+    - cron: '17 12 * * 1,3,5'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build (e.g. v8.00). Blank = run normal drift check.'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if a release with that tag already exists in this repo'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: floppy-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: memtest86plus/memtest86plus
+
+jobs:
+  detect:
+    name: Detect drift
+    runs-on: ubuntu-24.04
+    outputs:
+      tags: ${{ steps.resolve.outputs.tags }}
+    steps:
+      - name: Resolve tags to build
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # 1) Manual dispatch with an explicit tag: build exactly that one.
+          if [ -n "${INPUT_TAG:-}" ]; then
+            echo "Manual dispatch tag: ${INPUT_TAG}"
+            TAGS_JSON=$(jq -c -n --arg t "${INPUT_TAG}" '[$t]')
+            echo "tags=${TAGS_JSON}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Always need upstream's latest tag.
+          UPSTREAM_LATEST=$(gh release view --repo "${UPSTREAM}" --json tagName --jq .tagName)
+          echo "Upstream latest: ${UPSTREAM_LATEST}"
+
+          # 2) Force flag without an explicit tag: rebuild just the latest.
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "Force-rebuild requested; building upstream latest only."
+            TAGS_JSON=$(jq -c -n --arg t "${UPSTREAM_LATEST}" '[$t]')
+            echo "tags=${TAGS_JSON}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # 3) Cheap drift check: compare our latest release tag against upstream's.
+          # `gh release view` with no tag returns the latest; non-zero exit means
+          # we have no releases yet, which we treat as full drift (empty OUR_LATEST).
+          OUR_LATEST=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName 2>/dev/null || echo "")
+          echo "Our latest:      ${OUR_LATEST:-<none>}"
+
+          if [ "${OUR_LATEST}" = "${UPSTREAM_LATEST}" ]; then
+            echo "In sync; no backfill scan needed."
+            echo "tags=[]" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # 4) Drift detected: do the more expensive full-list backfill scan.
+          # Limit to 100 releases on each side as a sanity cap.
+          echo "Drift detected; scanning full release lists for missing tags."
+          UPSTREAM_TAGS=$(gh release list --repo "${UPSTREAM}" --limit 100 --json tagName --jq '[.[].tagName]')
+          OUR_TAGS=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName --jq '[.[].tagName]')
+          # Set difference: upstream tags that we don't have yet.
+          TAGS_JSON=$(jq -c -n --argjson u "${UPSTREAM_TAGS}" --argjson o "${OUR_TAGS}" '$u - $o')
+          echo "Missing tags: ${TAGS_JSON}"
+          echo "tags=${TAGS_JSON}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.tag }} (${{ matrix.arch }})
+    needs: detect
+    if: needs.detect.outputs.tags != '[]'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.detect.outputs.tags) }}
+        arch: [i586, x86_64]
+        include:
+          - arch: i586
+            dir: build/i586
+          - arch: x86_64
+            dir: build/x86_64
+    steps:
+      - name: Checkout upstream at ${{ matrix.tag }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ matrix.tag }}
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc-multilib \
+            clang \
+            libc6-dev-i386-cross \
+            dosfstools \
+            mtools
+
+      - name: Build floppy.img
+        working-directory: ${{ matrix.dir }}
+        env:
+          TAG: ${{ matrix.tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" floppy.img
+          out="memtest86plus-${TAG}-${ARCH}-floppy.img"
+          mv floppy.img "${out}"
+          ls -l "${out}"
+
+      - name: Upload floppy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: floppy-${{ matrix.tag }}-${{ matrix.arch }}
+          path: ${{ matrix.dir }}/memtest86plus-${{ matrix.tag }}-${{ matrix.arch }}-floppy.img
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish ${{ matrix.tag }}
+    needs: [detect, build]
+    if: needs.detect.outputs.tags != '[]'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.detect.outputs.tags) }}
+    steps:
+      - name: Download floppy artifacts for ${{ matrix.tag }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: floppy-${{ matrix.tag }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -l
+          sha256sum -- *.img | tee SHA256SUMS
+
+      - name: Create release ${{ matrix.tag }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+
+          # If a release already exists (force-rebuild path), remove it first
+          # so `gh release create` can recreate it atomically with the new assets.
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Removing existing release ${TAG} for re-publish."
+            gh release delete "${TAG}" --repo "${GITHUB_REPOSITORY}" --cleanup-tag --yes
+          fi
+
+          # Pull upstream's own release notes verbatim and prepend a header
+          # describing the floppy images shipped on this release.
+          upstream_body=$(gh release view "${TAG}" --repo "${UPSTREAM}" --json body --jq .body || true)
+
+          {
+            echo "## Floppy disk images"
+            echo
+            echo "This is an automated rebuild of upstream [\`${UPSTREAM}@${TAG}\`](https://github.com/${UPSTREAM}/releases/tag/${TAG}) packaged as 1.44 MB floppy disk images. Each \`*-floppy.img\` can be written directly to a 3.5\" floppy or booted via legacy BIOS as a floppy image (loopback, ROM emulation, virtual floppy in QEMU/VirtualBox, etc.)."
+            echo
+            echo "| Architecture       | File                                              |"
+            echo "|--------------------|---------------------------------------------------|"
+            echo "| x86 32-bit (i586)  | \`memtest86plus-${TAG}-i586-floppy.img\`           |"
+            echo "| x86-64 (64-bit)    | \`memtest86plus-${TAG}-x86_64-floppy.img\`         |"
+            echo
+            echo "Verify with \`sha256sum -c SHA256SUMS\`."
+            echo
+            echo "---"
+            echo
+            echo "## Upstream release notes"
+            echo
+            if [ -n "${upstream_body}" ]; then
+              printf '%s\n' "${upstream_body}"
+            else
+              echo "_Upstream did not provide a release body for [\`${TAG}\`](https://github.com/${UPSTREAM}/releases/tag/${TAG})._"
+            fi
+          } > notes.md
+
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "memtest86+ ${TAG} (floppy)" \
+            --notes-file notes.md \
+            dist/*.img dist/SHA256SUMS
