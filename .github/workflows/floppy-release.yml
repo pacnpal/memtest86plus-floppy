@@ -37,6 +37,10 @@ concurrency:
 
 env:
   UPSTREAM: memtest86plus/memtest86plus
+  # Opt into Node.js 24 for JS actions (upload-artifact, download-artifact,
+  # checkout, etc.). The runner default flips on 2026-06-02; setting this
+  # early silences the deprecation warning and verifies compatibility now.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   detect:
