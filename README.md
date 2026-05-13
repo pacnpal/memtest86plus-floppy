@@ -1,5 +1,38 @@
 # Memtest86+
 
+## About this fork
+
+This repository is an automated **floppy-image fork** of upstream
+[memtest86plus/memtest86plus](https://github.com/memtest86plus/memtest86plus).
+A scheduled GitHub Actions workflow polls upstream Mon/Wed/Fri; when an
+upstream release tag appears that we haven't built yet, it builds the
+`floppy.img` Make target for both architectures and publishes a matching
+release here. Tag names mirror upstream verbatim (e.g. `v8.00`).
+
+Each release contains:
+
+  * `memtest86plus-<tag>-i586-floppy.img` &mdash; 32-bit floppy image
+  * `memtest86plus-<tag>-x86_64-floppy.img` &mdash; 64-bit floppy image
+  * `SHA256SUMS`
+
+Both are 1.44 MB raw images suitable for direct write to a 3.5" floppy or
+for booting via legacy BIOS as a floppy image (loopback, ROM emulation,
+virtual floppy in QEMU/VirtualBox, etc.). The release notes embed
+upstream's release notes verbatim under a floppy-images header.
+
+Backfill is supported: when this fork has fewer releases than upstream, the
+workflow builds and publishes each missing upstream release in chronological
+order so the newest release ends up at the top of the releases page. The
+no-drift path (most scheduled runs) exits in seconds after two API calls.
+
+For other distribution formats (ISO images, UEFI binaries, USB-installable
+builds, nightly dev builds), see upstream and
+[memtest.org](https://memtest.org).
+
+The remainder of this README is upstream's, unmodified.
+
+---
+
 Memtest86+ is a free, open-source, stand-alone memory tester for x86, x86-64
 and LoongArch64 architecture computers. It provides a much more thorough memory
 check than that provided by BIOS memory tests.
